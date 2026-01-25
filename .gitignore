@@ -1,0 +1,8 @@
+node_modules
+nitkkr_full.txt
+embeddings.json
+.env
+index_old.js
+linkDO.js
+links.json
+docker-compose.yaml

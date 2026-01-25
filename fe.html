@@ -1,0 +1,98 @@
+<button onclick="startRecording()">Start</button>
+<button onclick="stopRecording()">Stop</button>
+
+<p id="status">Idle</p>
+
+<script>
+let mediaRecorder;
+let chunks = [];
+
+async function startRecording() {
+  document.getElementById("status").innerText = "🎙️ Recording...";
+
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  mediaRecorder = new MediaRecorder(stream);
+  chunks = [];
+  mediaRecorder.ondataavailable = e => chunks.push(e.data);
+  mediaRecorder.start();
+  console.log("Recording...");
+}
+
+async function stopRecording() {
+  document.getElementById("status").innerText = "🧠 Thinking...";
+  
+  mediaRecorder.stop();
+
+  mediaRecorder.onstop = async () => {
+    const blob = new Blob(chunks, { type: "audio/webm" });
+    console.log("Recorded blob size:", blob.size);
+
+    const formData = new FormData();
+    formData.append("audio", blob);
+
+    const res = await fetch("http://localhost:4000/voice", {
+      method: "POST",
+      body: formData
+    });
+
+    console.log("Backend response status:", res.status);
+
+    const audioBlob = await res.blob();
+    console.log("Received audio blob size:", audioBlob.size);
+
+    document.getElementById("status").innerText = "🔊 Replying...";
+
+    const audioUrl = URL.createObjectURL(audioBlob);
+    const audio = new Audio(audioUrl);
+    audio.play();
+
+    audio.onended = () => {
+      document.getElementById("status").innerText = " Idle";
+    };
+  };
+}
+</script>
+
+
+<!-- <button onclick="startRecording() ">Start</button>
+<button onclick="stopRecording()">Stop</button>
+
+<script>
+let mediaRecorder;
+let chunks = [];
+
+async function startRecording() {
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  mediaRecorder = new MediaRecorder(stream);
+  chunks = [];
+  mediaRecorder.ondataavailable = e => chunks.push(e.data);
+  mediaRecorder.start();
+  console.log("Recording...");
+}
+
+async function stopRecording() {
+  mediaRecorder.stop();
+
+  mediaRecorder.onstop = async () => {
+    const blob = new Blob(chunks, { type: "audio/webm" });
+    console.log("Recorded blob size:", blob.size);
+
+    const formData = new FormData();
+    formData.append("audio", blob);
+
+    const res = await fetch("http://localhost:4000/voice", {
+      method: "POST",
+      body: formData
+    });
+
+    console.log("Backend response status:", res.status);
+
+    const audioBlob = await res.blob();
+    console.log("Received audio blob size:", audioBlob.size);
+
+    const audioUrl = URL.createObjectURL(audioBlob);
+    const audio = new Audio(audioUrl);
+    audio.play();
+  };
+}
+</script> -->
