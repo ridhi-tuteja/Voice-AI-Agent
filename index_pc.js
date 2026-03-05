@@ -1,31 +1,33 @@
 import express from "express";
 import cors from "cors";
 import fs from "fs";
-// Store new vectors
 import csv from "csv-parser";
-
 import dotenv from "dotenv";
 import { pipeline } from "@xenova/transformers";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { Pinecone } from "@pinecone-database/pinecone";
 import { v4 as uuidv4 } from "uuid";
-
-const sessions = {};
-const MAX_HISTORY = 5; // last 5 turns
+import multer from "multer";
 
 dotenv.config();
 
 const app = express();
 app.use(express.json());
+// app.use(cors());
 
-// app.use(
-//   cors({
-//     origin: "http://127.0.0.1:5500/fe.html",
-//     methods: ["GET", "POST", "OPTIONS"],
-//     credentials: true,
-//   }),
-// );
-app.use(cors());
+app.use(cors({
+  exposedHeaders: ["session-id"]
+}));
+
+const sessions = {};
+const MAX_HISTORY = 5;
+
+const INTRO_MESSAGE =
+"Hello! I am Voice AI Agent, your hospital network assistant. How can I help you today?";
+
+const upload = multer({ dest: "uploads/" });
+
+/* ------------------ ElevenLabs TTS ------------------ */
 
 async function textToSpeech(text) {
   const response = await fetch(
@@ -33,7 +35,7 @@ async function textToSpeech(text) {
     {
       method: "POST",
       headers: {
-        "xi-api-key": process.env.ELEVENLABS_API_KEY,
+        "xi-api-key": process.env.ELEVENLABS_KEY,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
@@ -44,16 +46,17 @@ async function textToSpeech(text) {
           similarity_boost: 0.7,
         },
       }),
-    },
+    }
   );
 
   const buffer = await response.arrayBuffer();
   return Buffer.from(buffer);
 }
 
-// ------------------ Setup Embeddings and Gemini ------------------
+/* ------------------ Embeddings Setup ------------------ */
 
 let extractor;
+
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
@@ -63,11 +66,13 @@ async function initializeEmbeddingModel() {
 
 async function generateEmbeddings(text) {
   if (!extractor) await initializeEmbeddingModel();
+
   const output = await extractor(text, { pooling: "mean", normalize: true });
+
   return Array.from(output.data);
 }
 
-// ------------------ Setup Pinecone ------------------
+/* ------------------ Pinecone Setup ------------------ */
 
 const pinecone = new Pinecone({
   apiKey: process.env.PINECONE_API_KEY,
@@ -75,21 +80,7 @@ const pinecone = new Pinecone({
 
 const index = pinecone.index(process.env.PINECONE_INDEX_NAME);
 
-// Delete previous vectors
-async function deleteOldVectors() {
-  try {
-    const stats = await index.describeIndexStats();
-    const ids = Object.keys(stats.namespaces?.[""]?.vectorCount ?? {}).map(
-      (id) => id.toString(),
-    );
-    if (ids.length > 0) {
-      await index.delete1({ ids });
-      console.log(`🗑️ Deleted ${ids.length} old vectors.`);
-    }
-  } catch (error) {
-    console.error("Error deleting old vectors:", error.message);
-  }
-}
+/* ------------------ Load CSV & Store Embeddings ------------------ */
 
 async function loadEmbeddings() {
   try {
@@ -101,18 +92,16 @@ async function loadEmbeddings() {
         hospitals.push(row);
       })
       .on("end", async () => {
-        await deleteOldVectors();
-
         const vectors = [];
 
         for (let i = 0; i < hospitals.length; i++) {
           const h = hospitals[i];
 
           const text = `
-Hospital Name: ${h["HOSPITAL NAME"]}
-Address: ${h["Address"]}
-City: ${h["CITY"]}
-`;
+            Hospital Name: ${h["HOSPITAL NAME"]}
+            Address: ${h["Address"]}
+            City: ${h["CITY"]}
+            `;
 
           const embedding = await generateEmbeddings(text);
 
@@ -136,14 +125,14 @@ City: ${h["CITY"]}
           console.log(`Upserted batch ${i / BATCH_SIZE + 1}`);
         }
 
-        console.log("✅ Hospital embeddings stored in Pinecone.");
+        console.log("✅ Hospital embeddings stored/updated in Pinecone.");
       });
   } catch (error) {
     console.error("❌ Error storing hospital embeddings:", error.message);
   }
 }
 
-// ------------------ Query Pinecone ------------------
+/* ------------------ Pinecone Query ------------------ */
 
 async function queryPinecone(query) {
   const queryEmbedding = await generateEmbeddings(query);
@@ -157,7 +146,9 @@ async function queryPinecone(query) {
   return results;
 }
 
-async function generateResponse(query, history=[]) {
+/* ------------------ Generate Response ------------------ */
+
+async function generateResponse(query, history = []) {
   try {
     const results = await queryPinecone(query);
 
@@ -169,9 +160,9 @@ async function generateResponse(query, history=[]) {
       .map((match) => {
         const m = match.metadata;
         return `Hospital: ${m.name}
-Address: ${m.address}
-City: ${m.city}`;
-      })
+          Address: ${m.address}
+          City: ${m.city}`;
+          })
       .join("\n\n");
 
     const historyText = history
@@ -195,24 +186,26 @@ ${context}
 User question:
 ${query}
 
-If not found, reply:
+If not found reply:
 "Sorry, I could not find any matching hospital in the database."`;
 
     const result = await model.generateContent(prompt);
     const response = await result.response;
+
     return response.text();
-    // return prompt;
   } catch (error) {
     console.error("❌ Error generating response:", error.message);
     return "Sorry, there was a problem generating the response.";
   }
 }
 
-// ------------------ Routes ------------------
+/* ------------------ Routes ------------------ */
+
+/* Initialize embeddings */
 
 app.post("/initialize", async (req, res) => {
-  // Optional: protect this with a secret
   const token = req.headers.authorization;
+
   if (token !== `Bearer ${process.env.ADMIN_SECRET}`) {
     return res.status(401).json({ error: "Unauthorized" });
   }
@@ -225,6 +218,38 @@ app.post("/initialize", async (req, res) => {
   }
 });
 
+/* Intro route */
+
+app.post("/start", async (req, res) => {
+  try {
+
+    const sessionId = uuidv4();
+
+    sessions[sessionId] = {
+      history: []
+    };
+
+    const audioBuffer = await textToSpeech(INTRO_MESSAGE);
+
+    if (!audioBuffer || audioBuffer.length === 0) {
+      throw new Error("TTS returned empty audio");
+    }
+
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("session-id", sessionId);
+
+    res.end(audioBuffer);
+
+  } catch (err) {
+
+    console.error("START ROUTE ERROR:", err);
+
+    res.status(500).send("Failed to generate intro speech");
+
+  }
+});
+/* Query route */
+
 app.post("/query", async (req, res) => {
   try {
     let { question, sessionId } = req.body;
@@ -233,21 +258,33 @@ app.post("/query", async (req, res) => {
       return res.status(400).send("❗ Please provide a question.");
     }
 
-    // create new session if not provided
+    // if (!sessionId) {
+    //   sessionId = uuidv4();
+    //   sessions[sessionId] = [];
+    // }
+
+    let isNewSession = false;
+
     if (!sessionId) {
       sessionId = uuidv4();
       sessions[sessionId] = [];
+      isNewSession = true;
     }
 
     const history = sessions[sessionId] || [];
 
-    const response = await generateResponse(question, history);
+    // const response = await generateResponse(question, history);
+    let response;
 
-    // update history
+    if (isNewSession) {
+      response = INTRO_MESSAGE;
+    } else {
+      response = await generateResponse(question, history);
+    }
+
     history.push({ role: "user", text: question });
     history.push({ role: "assistant", text: response });
 
-    // keep only last N
     sessions[sessionId] = history.slice(-MAX_HISTORY * 2);
 
     res.json({ response, sessionId });
@@ -256,48 +293,29 @@ app.post("/query", async (req, res) => {
   }
 });
 
-import multer from "multer";
-const upload = multer({ dest: "uploads/" });
+/* Voice route */
 
-// app.post("/voice", upload.single("audio"), async (req, res) => {
-//   try {
-//     const fileBuffer = fs.readFileSync(req.file.path);
-
-//     const form = new FormData();
-//     form.append("model_id", "scribe_v2");
-//     form.append("file", new Blob([fileBuffer]), "audio.webm");
-
-//     const response = await fetch("https://api.elevenlabs.io/v1/speech-to-text", {
-//       method: "POST",
-//       headers: {
-//         "xi-api-key": process.env.ELEVENLABS_KEY
-//       },
-//       body: form
-//     });
-
-//     const data = await response.json();
-//     console.log("FULL RESPONSE:", data);
-//     console.log("Transcript:", data.text);
-//     const answer = await generateResponse(userText);
-
-//     fs.unlinkSync(req.file.path);
-//     res.json({ transcript: data.text });
-//   } catch (err) {
-//     console.error(err);
-//     res.status(500).send("Error");
-//   }
-// });
 app.post("/voice", upload.single("audio"), async (req, res) => {
   try {
     console.log("---- VOICE PIPELINE START ----");
 
-    // ========== STT ==========
+    console.log("Step 1: Checking uploaded audio");
+
+    if (!req.file) {
+      console.log("❌ No audio file received");
+      return res.status(400).send("No audio file uploaded");
+    }
+
+    console.log("✅ Audio received:", req.file.path);
+
     const fileBuffer = fs.readFileSync(req.file.path);
-    console.log("Audio file size:", fileBuffer.length);
+    console.log("Step 2: Audio buffer size:", fileBuffer.length);
 
     const sttForm = new FormData();
     sttForm.append("model_id", "scribe_v2");
     sttForm.append("file", new Blob([fileBuffer]), "audio.webm");
+
+    console.log("Step 3: Sending audio to STT...");
 
     const sttRes = await fetch("https://api.elevenlabs.io/v1/speech-to-text", {
       method: "POST",
@@ -307,20 +325,42 @@ app.post("/voice", upload.single("audio"), async (req, res) => {
       body: sttForm,
     });
 
-    console.log("STT status:", sttRes.status);
     const sttData = await sttRes.json();
-    console.log("STT raw:", sttData);
+    // console.log("STT raw response:", sttData);
+    console.log("STT status:", sttRes.status);
 
     const userText = sttData.text;
-    console.log("User said:", userText);
+    console.log("Step 4: Transcribed text:", userText);
 
-    // ========== RAG ==========
+    const sessionId = req.query.sessionId;
+
+    console.log("Session received:", sessionId);
+    console.log("Available sessions:", Object.keys(sessions));
+
+  if (!sessionId || !sessions[sessionId]) {
+    return res.status(400).send("Session not initialized. Please call /start first.");
+  }
+
+    // console.log("User said:", userText);
+    
+    // let answer;
+
+    // if (isNewSession || !sessions[sessionId].introDone) {
+    //   sessions[sessionId].introDone = true;
+    //   answer = INTRO_MESSAGE;
+    // } else if (!userText || userText.trim() === "") {
+    //   answer = INTRO_MESSAGE;
+    // } else {
+    //   answer = await generateResponse(userText);
+    // }
+
+    console.log("Step 5: Generating AI response...");
+
     let answer = await generateResponse(userText);
-    // const answer = "this is a test answer"
-    answer = answer.slice(0, 100);
+    answer = answer.slice(0, 500);
     console.log("AI answer:", answer);
 
-    // ========== TTS ==========
+    console.log("Step 6: Sending text to TTS...");
     const ttsRes = await fetch(
       `https://api.elevenlabs.io/v1/text-to-speech/${process.env.ELEVENLABS_VOICE_ID}`,
       {
@@ -333,29 +373,32 @@ app.post("/voice", upload.single("audio"), async (req, res) => {
           text: answer,
           model_id: "eleven_multilingual_v2",
         }),
-      },
+      }
     );
-
+    
     console.log("TTS status:", ttsRes.status);
-
     const audioArrayBuffer = await ttsRes.arrayBuffer();
     const audioBuffer = Buffer.from(audioArrayBuffer);
-    console.log("TTS audio size:", audioBuffer.length);
+
+    console.log("Step 7: Generated audio size:", audioBuffer.length);
 
     fs.unlinkSync(req.file.path);
 
-    // ========== SEND AUDIO ==========
     res.setHeader("Content-Type", "audio/mpeg");
     res.setHeader("Content-Length", audioBuffer.length);
-    res.setHeader("Cache-Control", "no-cache");
 
+    console.log("Step 8: Sending audio response to frontend");
     console.log("---- VOICE PIPELINE END ----");
+    
+    res.setHeader("session-id", sessionId);
     res.end(audioBuffer);
   } catch (err) {
     console.error("VOICE ERROR:", err);
     res.status(500).send("Voice pipeline failed");
   }
 });
+
+/* Health check */
 
 app.get("/health", async (req, res) => {
   try {
@@ -366,9 +409,10 @@ app.get("/health", async (req, res) => {
   }
 });
 
-// ------------------ Start Server ------------------
+/* ------------------ Start Server ------------------ */
 
 const PORT = process.env.PORT || 3000;
+
 app.listen(PORT, "0.0.0.0", async () => {
   console.log(`🚀 Server running on port ${PORT}`);
 

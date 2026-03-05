@@ -1,4 +1,4 @@
-<button onclick="startRecording()">Start</button>
+<button onclick="startConversation()">Start</button>
 <button onclick="stopRecording()">Stop</button>
 
 <p id="status">Idle</p>
@@ -6,93 +6,113 @@
 <script>
 let mediaRecorder;
 let chunks = [];
+let sessionId = null;
 
-async function startRecording() {
-  document.getElementById("status").innerText = "🎙️ Recording...";
+/* ---------------- START CONVERSATION ---------------- */
 
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  mediaRecorder = new MediaRecorder(stream);
-  chunks = [];
-  mediaRecorder.ondataavailable = e => chunks.push(e.data);
-  mediaRecorder.start();
-  console.log("Recording...");
+async function startConversation() {
+
+  document.getElementById("status").innerText = "🤖 Starting AI...";
+
+  try {
+
+    const res = await fetch("http://localhost:4000/start", {
+      method: "POST"
+    });
+
+    console.log("Start status:", res.status);
+
+    sessionId = res.headers.get("session-id");
+    console.log("Session ID:", sessionId);
+
+    const introBlob = await res.blob();
+    console.log("Intro audio size:", introBlob.size);
+
+    const introUrl = URL.createObjectURL(introBlob);
+    const introAudio = new Audio(introUrl);
+
+    introAudio.play();
+
+    introAudio.onended = async () => {
+
+      document.getElementById("status").innerText = "🎙️ Recording...";
+
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+      mediaRecorder = new MediaRecorder(stream);
+      chunks = [];
+
+      mediaRecorder.ondataavailable = e => {
+        chunks.push(e.data);
+      };
+
+      mediaRecorder.start();
+
+      console.log("Recording started");
+
+    };
+
+  } catch (error) {
+    console.error("Start error:", error);
+    document.getElementById("status").innerText = "Error starting AI";
+  }
 }
 
+/* ---------------- STOP RECORDING ---------------- */
+
 async function stopRecording() {
+
+  if (!mediaRecorder) {
+    console.log("No active recording");
+    return;
+  }
+
   document.getElementById("status").innerText = "🧠 Thinking...";
-  
+
   mediaRecorder.stop();
 
   mediaRecorder.onstop = async () => {
-    const blob = new Blob(chunks, { type: "audio/webm" });
-    console.log("Recorded blob size:", blob.size);
 
-    const formData = new FormData();
-    formData.append("audio", blob);
+    try {
 
-    const res = await fetch("http://localhost:4000/voice", {
-      method: "POST",
-      body: formData
-    });
+      const blob = new Blob(chunks, { type: "audio/webm" });
+      console.log("Recorded blob size:", blob.size);
 
-    console.log("Backend response status:", res.status);
+      const formData = new FormData();
+      formData.append("audio", blob);
 
-    const audioBlob = await res.blob();
-    console.log("Received audio blob size:", audioBlob.size);
+      const res = await fetch(`http://localhost:4000/voice?sessionId=${sessionId}`, {
+        method: "POST",
+        body: formData
+      });
 
-    document.getElementById("status").innerText = "🔊 Replying...";
+      console.log("Backend response status:", res.status);
 
-    const audioUrl = URL.createObjectURL(audioBlob);
-    const audio = new Audio(audioUrl);
-    audio.play();
+      if (!res.ok) {
+        const text = await res.text();
+        console.error("Server error:", text);
+        document.getElementById("status").innerText = "Server error";
+        return;
+      }
 
-    audio.onended = () => {
-      document.getElementById("status").innerText = " Idle";
-    };
+      const audioBlob = await res.blob();
+      console.log("Received audio blob size:", audioBlob.size);
+
+      const audioUrl = URL.createObjectURL(audioBlob);
+      const audio = new Audio(audioUrl);
+
+      document.getElementById("status").innerText = "🔊 Replying...";
+
+      audio.play();
+
+      audio.onended = () => {
+        document.getElementById("status").innerText = "Idle";
+      };
+
+    } catch (error) {
+      console.error("Voice pipeline error:", error);
+      document.getElementById("status").innerText = "Error";
+    }
   };
 }
 </script>
-
-
-<!-- <button onclick="startRecording() ">Start</button>
-<button onclick="stopRecording()">Stop</button>
-
-<script>
-let mediaRecorder;
-let chunks = [];
-
-async function startRecording() {
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  mediaRecorder = new MediaRecorder(stream);
-  chunks = [];
-  mediaRecorder.ondataavailable = e => chunks.push(e.data);
-  mediaRecorder.start();
-  console.log("Recording...");
-}
-
-async function stopRecording() {
-  mediaRecorder.stop();
-
-  mediaRecorder.onstop = async () => {
-    const blob = new Blob(chunks, { type: "audio/webm" });
-    console.log("Recorded blob size:", blob.size);
-
-    const formData = new FormData();
-    formData.append("audio", blob);
-
-    const res = await fetch("http://localhost:4000/voice", {
-      method: "POST",
-      body: formData
-    });
-
-    console.log("Backend response status:", res.status);
-
-    const audioBlob = await res.blob();
-    console.log("Received audio blob size:", audioBlob.size);
-
-    const audioUrl = URL.createObjectURL(audioBlob);
-    const audio = new Audio(audioUrl);
-    audio.play();
-  };
-}
-</script> -->
