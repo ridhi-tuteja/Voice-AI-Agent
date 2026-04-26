@@ -2,61 +2,83 @@ import express from "express";
 import cors from "cors";
 import fs from "fs";
 import csv from "csv-parser";
+import axios from "axios";
 import dotenv from "dotenv";
 import { pipeline } from "@xenova/transformers";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { Pinecone } from "@pinecone-database/pinecone";
 import { v4 as uuidv4 } from "uuid";
+import FormData from "form-data";
 import multer from "multer";
+
+const sessions = {};
+const MAX_HISTORY = 5;
 
 dotenv.config();
 
 const app = express();
 app.use(express.json());
-// app.use(cors());
+app.use(cors());
 
-app.use(cors({
-  exposedHeaders: ["session-id"]
-}));
+// ── STT: Groq Whisper (free, no VPN issues, 7200 sec/day) ────────────────────
+async function speechToText(filePath, mimeType) {
+  const form = new FormData();
+  form.append("file", fs.createReadStream(filePath), {
+    filename: "audio.webm",
+    contentType: mimeType || "audio/webm",
+  });
+  form.append("model", "whisper-large-v3-turbo");
+  form.append("response_format", "json");
+  form.append("language", "en");
 
-const sessions = {};
-const MAX_HISTORY = 5;
-
-const INTRO_MESSAGE =
-"Hello! I am Voice AI Agent, your hospital network assistant. How can I help you today?";
-
-const upload = multer({ dest: "uploads/" });
-
-/* ------------------ ElevenLabs TTS ------------------ */
-
-async function textToSpeech(text) {
-  const response = await fetch(
-    `https://api.elevenlabs.io/v1/text-to-speech/${process.env.ELEVENLABS_VOICE_ID}`,
+  const res = await axios.post(
+    "https://api.groq.com/openai/v1/audio/transcriptions",
+    form,
     {
-      method: "POST",
       headers: {
-        "xi-api-key": process.env.ELEVENLABS_KEY,
-        "Content-Type": "application/json",
+        Authorization: "Bearer " + process.env.GROQ_API_KEY,
+        ...form.getHeaders(),
       },
-      body: JSON.stringify({
-        text,
-        model_id: "eleven_multilingual_v2",
-        voice_settings: {
-          stability: 0.5,
-          similarity_boost: 0.7,
-        },
-      }),
+      timeout: 30000,
+    }
+  );
+  return res.data.text || "";
+}
+
+// ── TTS: Groq PlayAI TTS (free, same GROQ_API_KEY) ───────────────────────────
+// Docs: https://console.groq.com/docs/text-to-speech
+// Available voices: https://console.groq.com/docs/text-to-speech#supported-voices
+async function textToSpeech(text) {
+  const res = await axios.post(
+    "https://api.groq.com/openai/v1/audio/speech",
+    {
+       model: "canopylabs/orpheus-v1-english",
+       voice: "diana",
+       input: text,
+       response_format: "wav",
+    },
+    {
+      headers: {
+        Authorization: "Bearer " + process.env.GROQ_API_KEY,
+        "Content-Type": "application/json",
+        Accept: "audio/mpeg",
+      },
+      responseType: "arraybuffer",
+      timeout: 30000,
+      maxBodyLength: Infinity,
     }
   );
 
-  const buffer = await response.arrayBuffer();
-  return Buffer.from(buffer);
+  if (!res.data || res.data.byteLength === 0) {
+    throw new Error("TTS returned empty audio buffer");
+  }
+
+  return Buffer.from(res.data);
 }
 
-/* ------------------ Embeddings Setup ------------------ */
+// ── Embeddings + Gemini ───────────────────────────────────────────────────────
 
 let extractor;
-
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
@@ -66,339 +88,262 @@ async function initializeEmbeddingModel() {
 
 async function generateEmbeddings(text) {
   if (!extractor) await initializeEmbeddingModel();
-
   const output = await extractor(text, { pooling: "mean", normalize: true });
-
   return Array.from(output.data);
 }
 
-/* ------------------ Pinecone Setup ------------------ */
+// ── Pinecone ──────────────────────────────────────────────────────────────────
 
-const pinecone = new Pinecone({
-  apiKey: process.env.PINECONE_API_KEY,
-});
-
+const pinecone = new Pinecone({ apiKey: process.env.PINECONE_API_KEY });
 const index = pinecone.index(process.env.PINECONE_INDEX_NAME);
 
-/* ------------------ Load CSV & Store Embeddings ------------------ */
-
-async function loadEmbeddings() {
+async function deleteOldVectors() {
   try {
-    const hospitals = [];
-
-    fs.createReadStream("hospital_data.csv")
-      .pipe(csv())
-      .on("data", (row) => {
-        hospitals.push(row);
-      })
-      .on("end", async () => {
-        const vectors = [];
-
-        for (let i = 0; i < hospitals.length; i++) {
-          const h = hospitals[i];
-
-          const text = `
-            Hospital Name: ${h["HOSPITAL NAME"]}
-            Address: ${h["Address"]}
-            City: ${h["CITY"]}
-            `;
-
-          const embedding = await generateEmbeddings(text);
-
-          vectors.push({
-            id: `hospital_${i}`,
-            values: embedding,
-            metadata: {
-              name: h["HOSPITAL NAME"],
-              address: h["Address"],
-              city: h["CITY"],
-              content: text,
-            },
-          });
-        }
-
-        const BATCH_SIZE = 50;
-
-        for (let i = 0; i < vectors.length; i += BATCH_SIZE) {
-          const batch = vectors.slice(i, i + BATCH_SIZE);
-          await index.upsert(batch);
-          console.log(`Upserted batch ${i / BATCH_SIZE + 1}`);
-        }
-
-        console.log("✅ Hospital embeddings stored/updated in Pinecone.");
-      });
+    const stats = await index.describeIndexStats();
+    const ids = Object.keys(stats.namespaces?.[""]?.vectorCount ?? {}).map(
+      (id) => id.toString()
+    );
+    if (ids.length > 0) {
+      await index.delete({ ids });
+      console.log(`Deleted ${ids.length} old vectors.`);
+    }
   } catch (error) {
-    console.error("❌ Error storing hospital embeddings:", error.message);
+    console.error("Error deleting old vectors:", error.message);
   }
 }
 
-/* ------------------ Pinecone Query ------------------ */
+async function loadEmbeddings() {
+  const hospitals = [];
+
+  await new Promise((resolve, reject) => {
+    fs.createReadStream("hospital_data.csv")
+      .pipe(csv())
+      .on("data", (row) => hospitals.push(row))
+      .on("end", resolve)
+      .on("error", reject);
+  });
+
+  await deleteOldVectors();
+
+  const vectors = [];
+  for (let i = 0; i < hospitals.length; i++) {
+    const h = hospitals[i];
+    const text = `Hospital Name: ${h["HOSPITAL NAME"]}\nAddress: ${h["Address"]}\nCity: ${h["CITY"]}`;
+    const embedding = await generateEmbeddings(text);
+    vectors.push({
+      id: `hospital_${i}`,
+      values: embedding,
+      metadata: {
+        name: h["HOSPITAL NAME"],
+        address: h["Address"],
+        city: h["CITY"],
+        content: text,
+      },
+    });
+  }
+
+  const BATCH_SIZE = 50;
+  for (let i = 0; i < vectors.length; i += BATCH_SIZE) {
+    await index.upsert(vectors.slice(i, i + BATCH_SIZE));
+    console.log(`Upserted batch ${Math.floor(i / BATCH_SIZE) + 1}`);
+  }
+
+  console.log("Hospital embeddings stored in Pinecone.");
+}
+
+// ── RAG Query ─────────────────────────────────────────────────────────────────
+
+// Expand user query with known spelling variants and aliases
+function expandQuery(query) {
+  const aliases = {
+    "sajapur": "sarjapur",
+    "sajjapur": "sarjapur", 
+    "sarjapur": "sarjapur",
+    "koramangala": "koramangala",
+    "bengalore": "bengaluru",
+    "bangalore": "bengaluru",
+    "bombay": "mumbai",
+    "calcutta": "kolkata",
+    "gurgaon": "gurugram",
+    "new delhi": "delhi",
+    "dwarka": "dwarka",
+    "connaught": "connaught place",
+  };
+  let expanded = query.toLowerCase();
+  for (const [typo, correct] of Object.entries(aliases)) {
+    if (expanded.includes(typo)) {
+      expanded = expanded.replace(typo, correct);
+    }
+  }
+  return expanded;
+}
 
 async function queryPinecone(query) {
   const queryEmbedding = await generateEmbeddings(query);
-
-  const results = await index.query({
+  return await index.query({
     vector: queryEmbedding,
     topK: 10,
     includeMetadata: true,
   });
-
-  return results;
 }
-
-/* ------------------ Generate Response ------------------ */
 
 async function generateResponse(query, history = []) {
   try {
-    const results = await queryPinecone(query);
+    // Expand query with fuzzy city/area terms for better recall
+    const expandedQuery = expandQuery(query);
+    console.log("Expanded query:", expandedQuery);
+
+    const results = await queryPinecone(expandedQuery);
 
     if (!results || results.matches.length === 0) {
       return "Sorry, I could not find any relevant information.";
     }
 
-    const context = results.matches
-      .map((match) => {
-        const m = match.metadata;
-        return `Hospital: ${m.name}
-          Address: ${m.address}
-          City: ${m.city}`;
-          })
+    // Filter matches by score threshold to avoid irrelevant results
+    const goodMatches = results.matches.filter(m => m.score > 0.3);
+    const matchesToUse = goodMatches.length > 0 ? goodMatches : results.matches.slice(0, 3);
+
+    const context = matchesToUse
+      .map((m) => `Hospital: ${m.metadata.name}\nAddress: ${m.metadata.address}\nCity: ${m.metadata.city}`)
       .join("\n\n");
 
     const historyText = history
       .map((h) => `${h.role === "user" ? "User" : "Assistant"}: ${h.text}`)
       .join("\n");
 
-    const prompt = `You are an AI assistant for a hospital directory system.
+    const prompt = `You are Loop AI, a friendly voice assistant for the Loop Health hospital network.
+Responses will be spoken aloud — keep them natural and concise (3-5 sentences max).
+Do NOT give medical advice. Only use hospital information from the context below.
+If the question is unrelated to hospitals, say: "I\'m sorry, I can\'t help with that. I am forwarding this to a human agent."
 
-You help users find hospitals based on name, city, or address.
-
-Rules:
-- Do NOT give medical advice.
-- Only provide hospital information from the context.
+IMPORTANT RULES:
+- Always include the full address of each hospital in your response.
+- If user asks for hospitals near an area or locality (like Sarjapur, Dwarka, Connaught Place), 
+  look for hospitals whose address contains that area name — not just the city.
+- If no hospital address matches the requested area, say so honestly and suggest nearby cities instead.
+- Never say "You can find their addresses in the Loop Health network" — always say the address directly.
 
 Conversation so far:
 ${historyText}
 
-Context:
+Context (hospitals from database):
 ${context}
 
-User question:
-${query}
+User question: ${query}
 
-If not found reply:
-"Sorry, I could not find any matching hospital in the database."`;
+Respond naturally as if speaking. Include hospital names AND their full addresses.
+If no relevant match found for the specific area, say: "I couldn\'t find hospitals specifically near [area], but here are some in [city]: ..."`;
 
     const result = await model.generateContent(prompt);
-    const response = await result.response;
-
-    return response.text();
+    return result.response.text();
   } catch (error) {
-    console.error("❌ Error generating response:", error.message);
+    console.error("Error generating response:", error.message);
     return "Sorry, there was a problem generating the response.";
   }
 }
 
-/* ------------------ Routes ------------------ */
+// ── Routes ────────────────────────────────────────────────────────────────────
 
-/* Initialize embeddings */
+const upload = multer({ dest: "uploads/" });
 
 app.post("/initialize", async (req, res) => {
   const token = req.headers.authorization;
-
   if (token !== `Bearer ${process.env.ADMIN_SECRET}`) {
     return res.status(401).json({ error: "Unauthorized" });
   }
-
   try {
     await loadEmbeddings();
-    res.status(200).send("✅ Pinecone index initialized successfully.");
+    res.status(200).send("Pinecone index initialized successfully.");
   } catch (error) {
-    res.status(500).send("❌ Initialization failed: " + error.message);
+    res.status(500).send("Initialization failed: " + error.message);
   }
 });
-
-/* Intro route */
-
-app.post("/start", async (req, res) => {
-  try {
-
-    const sessionId = uuidv4();
-
-    sessions[sessionId] = {
-      history: []
-    };
-
-    const audioBuffer = await textToSpeech(INTRO_MESSAGE);
-
-    if (!audioBuffer || audioBuffer.length === 0) {
-      throw new Error("TTS returned empty audio");
-    }
-
-    res.setHeader("Content-Type", "audio/mpeg");
-    res.setHeader("session-id", sessionId);
-
-    res.end(audioBuffer);
-
-  } catch (err) {
-
-    console.error("START ROUTE ERROR:", err);
-
-    res.status(500).send("Failed to generate intro speech");
-
-  }
-});
-/* Query route */
 
 app.post("/query", async (req, res) => {
   try {
     let { question, sessionId } = req.body;
-
-    if (!question) {
-      return res.status(400).send("❗ Please provide a question.");
-    }
-
-    // if (!sessionId) {
-    //   sessionId = uuidv4();
-    //   sessions[sessionId] = [];
-    // }
-
-    let isNewSession = false;
+    if (!question) return res.status(400).send("Please provide a question.");
 
     if (!sessionId) {
       sessionId = uuidv4();
       sessions[sessionId] = [];
-      isNewSession = true;
     }
 
     const history = sessions[sessionId] || [];
-
-    // const response = await generateResponse(question, history);
-    let response;
-
-    if (isNewSession) {
-      response = INTRO_MESSAGE;
-    } else {
-      response = await generateResponse(question, history);
-    }
+    const response = await generateResponse(question, history);
 
     history.push({ role: "user", text: question });
     history.push({ role: "assistant", text: response });
-
     sessions[sessionId] = history.slice(-MAX_HISTORY * 2);
 
     res.json({ response, sessionId });
   } catch (error) {
-    res.status(500).send("❌ Query failed: " + error.message);
+    res.status(500).send("Query failed: " + error.message);
   }
 });
 
-/* Voice route */
+// ── Voice Route ───────────────────────────────────────────────────────────────
 
 app.post("/voice", upload.single("audio"), async (req, res) => {
-  try {
-    console.log("---- VOICE PIPELINE START ----");
+  const filePath = req.file && req.file.path;
 
-    console.log("Step 1: Checking uploaded audio");
+  try {
+    console.log("----- VOICE PIPELINE START -----");
 
     if (!req.file) {
-      console.log("❌ No audio file received");
-      return res.status(400).send("No audio file uploaded");
+      return res.status(400).send("No audio uploaded");
     }
 
-    console.log("✅ Audio received:", req.file.path);
+    console.log("File received:", req.file.originalname, "| size:", req.file.size);
 
-    const fileBuffer = fs.readFileSync(req.file.path);
-    console.log("Step 2: Audio buffer size:", fileBuffer.length);
+    // 1. Groq Whisper STT
+    console.log("STT (Groq Whisper)...");
+    const userText = await speechToText(filePath, req.file.mimetype);
+    console.log("Transcript:", userText);
 
-    const sttForm = new FormData();
-    sttForm.append("model_id", "scribe_v2");
-    sttForm.append("file", new Blob([fileBuffer]), "audio.webm");
+    if (!userText || !userText.trim()) {
+      throw new Error("Empty transcript returned");
+    }
 
-    console.log("Step 3: Sending audio to STT...");
-
-    const sttRes = await fetch("https://api.elevenlabs.io/v1/speech-to-text", {
-      method: "POST",
-      headers: {
-        "xi-api-key": process.env.ELEVENLABS_KEY,
-      },
-      body: sttForm,
-    });
-
-    const sttData = await sttRes.json();
-    // console.log("STT raw response:", sttData);
-    console.log("STT status:", sttRes.status);
-
-    const userText = sttData.text;
-    console.log("Step 4: Transcribed text:", userText);
-
-    const sessionId = req.query.sessionId;
-
-    console.log("Session received:", sessionId);
-    console.log("Available sessions:", Object.keys(sessions));
-
-  if (!sessionId || !sessions[sessionId]) {
-    return res.status(400).send("Session not initialized. Please call /start first.");
-  }
-
-    // console.log("User said:", userText);
-    
-    // let answer;
-
-    // if (isNewSession || !sessions[sessionId].introDone) {
-    //   sessions[sessionId].introDone = true;
-    //   answer = INTRO_MESSAGE;
-    // } else if (!userText || userText.trim() === "") {
-    //   answer = INTRO_MESSAGE;
-    // } else {
-    //   answer = await generateResponse(userText);
-    // }
-
-    console.log("Step 5: Generating AI response...");
-
+    // 2. RAG + Gemini
+    console.log("RAG + Gemini...");
     let answer = await generateResponse(userText);
     answer = answer.slice(0, 500);
-    console.log("AI answer:", answer);
+    console.log("Answer:", answer);
 
-    console.log("Step 6: Sending text to TTS...");
-    const ttsRes = await fetch(
-      `https://api.elevenlabs.io/v1/text-to-speech/${process.env.ELEVENLABS_VOICE_ID}`,
-      {
-        method: "POST",
-        headers: {
-          "xi-api-key": process.env.ELEVENLABS_KEY,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          text: answer,
-          model_id: "eleven_multilingual_v2",
-        }),
-      }
-    );
-    
-    console.log("TTS status:", ttsRes.status);
-    const audioArrayBuffer = await ttsRes.arrayBuffer();
-    const audioBuffer = Buffer.from(audioArrayBuffer);
+    // 3. Groq PlayAI TTS
+    console.log("TTS (Groq PlayAI)...");
+    let audioBuffer;
+    try {
+      audioBuffer = await textToSpeech(answer);
+    } catch (ttsErr) {
+      const detail = ttsErr.response && ttsErr.response.data
+        ? Buffer.from(ttsErr.response.data).toString()
+        : ttsErr.message;
+      console.error("TTS error detail:", ttsErr.response && ttsErr.response.status, detail);
+      throw new Error("TTS failed: " + detail);
+    }
+    console.log("Audio size:", audioBuffer.length);
 
-    console.log("Step 7: Generated audio size:", audioBuffer.length);
-
-    fs.unlinkSync(req.file.path);
+    // 4. Cleanup + respond
+    fs.unlinkSync(filePath);
+    console.log("----- VOICE PIPELINE END -----");
 
     res.setHeader("Content-Type", "audio/mpeg");
     res.setHeader("Content-Length", audioBuffer.length);
-
-    console.log("Step 8: Sending audio response to frontend");
-    console.log("---- VOICE PIPELINE END ----");
-    
-    res.setHeader("session-id", sessionId);
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("X-Transcript", encodeURIComponent(userText));
+    res.setHeader("X-Response-Text", encodeURIComponent(answer));
     res.end(audioBuffer);
+
   } catch (err) {
-    console.error("VOICE ERROR:", err);
-    res.status(500).send("Voice pipeline failed");
+    console.error("VOICE ERROR:", err.message);
+    if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    res.status(500).send("Voice pipeline failed: " + err.message);
   }
 });
 
-/* Health check */
+// ── Health ────────────────────────────────────────────────────────────────────
 
 app.get("/health", async (req, res) => {
   try {
@@ -409,18 +354,16 @@ app.get("/health", async (req, res) => {
   }
 });
 
-/* ------------------ Start Server ------------------ */
+// ── Start ─────────────────────────────────────────────────────────────────────
 
-const PORT = process.env.PORT || 3000;
-
+const PORT = process.env.PORT || 4000;
 app.listen(PORT, "0.0.0.0", async () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-
+  console.log(`Server running on port ${PORT}`);
   if (process.env.AUTO_INITIALIZE === "True") {
     try {
       await loadEmbeddings();
     } catch (err) {
-      console.error("❌ Auto-initialization failed:", err);
+      console.error("Auto-initialization failed:", err);
     }
   }
 });
