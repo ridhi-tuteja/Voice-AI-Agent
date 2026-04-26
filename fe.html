@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>Voice AI Agent — Hospital Network</title>
+<title>HealthBot Voice — Hospital Network</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;1,300&display=swap" rel="stylesheet">
 <style>
@@ -22,7 +22,7 @@
 
   html, body {
     height: 100%;
-    overflow: hidden;
+    overflow: hidden; /* no scroll on the page */
   }
 
   body {
@@ -410,7 +410,7 @@
           <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
         </svg>
       </div>
-      <div class="logo-text">Voice<span>AI</span> Agent</div>
+      <div class="logo-text">HealthBot<span> Voice</span></div>
     </div>
     <div class="status-pill" id="status-pill">Ready</div>
   </header>
@@ -465,7 +465,7 @@
         <div id="text-you"></div>
       </div>
       <div class="bubble bubble-ai" id="bubble-ai">
-        <div class="label">Voice AI Agent</div>
+        <div class="label">HealthBot Voice</div>
         <div id="text-ai"></div>
       </div>
     </div>
@@ -488,7 +488,7 @@
 
   <footer>
     <span>Powered by <strong>Groq</strong> · <strong>Gemini</strong> · <strong>Pinecone</strong></span>
-    <span>Voice AI Agent · 2,180+ hospitals</span>
+    <span>HealthBot Voice · 2,180+ hospitals</span>
   </footer>
 
 </div>
@@ -523,7 +523,7 @@ function setState(state) {
     idle:      { btnClass:'',          stageClass:'',          pill:'Ready',       label:'Tap to speak',       icon:iconMic },
     recording: { btnClass:'recording', stageClass:'recording', pill:'Recording…',  label:'Tap to stop',        icon:iconStop, wave:true },
     thinking:  { btnClass:'thinking',  stageClass:'',          pill:'Thinking…',   label:'Processing…',        icon:iconSpin, disabled:true },
-    speaking:  { btnClass:'speaking',  stageClass:'',          pill:'Speaking…',   label:'Voice AI talking…',  icon:iconMic, disabled:true },
+    speaking:  { btnClass:'speaking',  stageClass:'',          pill:'Speaking…',   label:'HealthBot talking…',  icon:iconMic, disabled:true },
   };
 
   const s = states[state];
